@@ -1,0 +1,217 @@
+<#   
+
+.PARAMETER SubscriptionName  
+       
+#> 
+param (
+    [string]$SubscriptionName = "Microsoft Partner Network",
+    [bool]$debug = $false
+)
+
+##########################################################################################################################################################
+Import-Module Az.Accounts
+Import-Module Az.Sql
+Import-Module Az.Synapse
+##########################################################################################################################################################
+#Parameters
+##########################################################################################################################################################
+$ErrorActionPreference = "Continue"
+
+##########################################################################################################################################################
+#VARIABLES
+##########################################################################################################################################################
+[int]$iErrorCount = 0
+[System.Collections.ArrayList]$AzureSQLServers = @()
+[System.Collections.ArrayList]$AzureSynapseWorkspaces = @()
+[System.Collections.ArrayList]$SynapseSqlPools = @()
+
+##########################################################################################################################################################
+#Connect
+##########################################################################################################################################################
+#https://docs.microsoft.com/en-us/azure/automation/automation-connections?tabs=azure-powershell#get-a-connection-in-a-runbook-or-dsc-configuration
+
+$Conn = Get-AutomationConnection -Name "AzureRunAsConnection"
+Connect-AzAccount -ServicePrincipal -Tenant $Conn.TenantID -ApplicationId $Conn.ApplicationID -CertificateThumbprint $Conn.CertificateThumbprint -Subscription $SubscriptionName
+
+##########################################################################################################################################################
+#Get SQL / Synapse RESOURCES
+##########################################################################################################################################################
+Write-Output ""
+Write-Output "---------------------------------------------------------------------------------------------------"
+Write-Output "Get SQL / Synapse RESOURCES"
+Write-Output "---------------------------------------------------------------------------------------------------"
+
+try {
+    $AzureSQLServers = @(Get-AzSqlServer -ErrorAction Stop)
+    $AzureSynapseWorkspaces = @(Get-AzSynapseWorkspace -ErrorAction Stop)        
+}
+catch {
+    $iErrorCount += 1;
+    Write-Error $_.Exception.Message
+}
+
+#$AzureSynapseWorkspaces | Out-GridView
+#$AzureSQLServers | Out-GridView
+
+##########################################################################################################################################################
+# Loop through all Synapse Workspaces
+##########################################################################################################################################################
+Write-Output ""
+Write-Output "---------------------------------------------------------------------------------------------------"
+Write-Output "Loop through all Synapse Workspaces"
+Write-Output "---------------------------------------------------------------------------------------------------"
+
+for ($i = 0; $i -lt $AzureSynapseWorkspaces.Count; $i++) {
+    $AzureSynapseWorkspace = $AzureSynapseWorkspaces[$i]
+
+    Write-Output " ***************************************************************************************"
+    Write-Output " Checking Azure Synapse Workspace [$($AzureSynapseWorkspace.Name)] for Synapse SQL Pools"
+    
+    try {
+        $SynapseSqlPools = @($AzureSynapseWorkspace | Get-AzSynapseSqlPool -ErrorAction Stop)
+    }
+    catch [Microsoft.Azure.Commands.Synapse.Models.Exceptions.SynapseException] {
+        if ($_.Exception.InnerException.Message -eq "Operation returned an invalid status code 'Conflict'") {
+            Write-Error "  -> Operation returned an invalid status code 'Conflict'"
+            Write-Output "  -> Removed ($($AzureSynapseWorkspace.Name)) from AzureSynapseWorkspaces"            
+            $AzureSynapseWorkspaces.Remove($AzureSynapseWorkspace);
+        }
+        else {
+            $iErrorCount += 1;
+            Write-Error $_.Exception.Message       
+        }
+    }
+    catch {
+        $iErrorCount += 1;
+        Write-Error $_.Exception.Message
+    }
+
+    foreach ($SynapseSqlPool in $SynapseSqlPools) {
+            
+            ##########################################################################################################################################################
+            if ($SynapseSqlPool.Status -eq "Online") {
+                Write-Output "  -> Synapse SQL Pool [$($SynapseSqlPool.SqlPoolName)] found with status [Online]"
+            }
+            ##########################################################################################################################################################
+            elseif ($SynapseSqlPool.Status -eq "Paused") {
+                Write-Output "  -> Synapse SQL Pool [$($SynapseSqlPool.SqlPoolName)] found with status [Paused]"
+                # Start Synapse SQL Pool
+                $startTimeResume = Get-Date
+                Write-Output "  -> Resuming Synapse SQL Pool [$($SynapseSqlPool.SqlPoolName)]"
+                
+                if (!$debug) {
+                    $resultsynapseSqlPool = $SynapseSqlPool | Resume-AzSynapseSqlPool
+                }
+                
+                # Show that the Synapse SQL Pool has been resumed and how long it took
+                $endTimeResume = Get-Date
+                $durationResume = NEW-TIMESPAN –Start $startTimeResume –End $endTimeResume
+
+                if ($resultsynapseSqlPool.Status -eq "Online") {
+                    Write-Output "  -> Synapse SQL Pool [$($resultsynapseSqlPool.SqlPoolName)] resumed in $($durationResume.Hours) hours, $($durationResume.Minutes) minutes and $($durationResume.Seconds) seconds. Current status [$($resultsynapseSqlPool.Status)]"
+                }
+                else {
+                    if (!$debug) {
+                        $iErrorCount += 1;
+                        Write-Error "  -> (resultsynapseSqlPool.Status -ne ""Online"") - Synapse SQL Pool [$($resultsynapseSqlPool.SqlPoolName)] resumed in $($durationResume.Hours) hours, $($durationResume.Minutes) minutes and $($durationResume.Seconds) seconds. Current status [$($resultsynapseSqlPool.Status)]"
+                    }
+                    else {
+                        Write-Host "This is a debug session - Nothing was done" -ForegroundColor Yellow
+                    }
+                }           
+            }
+            ##########################################################################################################################################################
+            else {
+                $iErrorCount += 1;
+                Write-Error "  -> (SynapseSqlPool.Status -eq ""Online"") Checking Synapse SQL Pool [$($SynapseSqlPool.SqlPoolName)] found with status [$($SynapseSqlPool.Status)]"
+            }
+            ##########################################################################################################################################################
+        }    
+    }
+
+    ##########################################################################################################################################################
+# Loop through all SQL Servers (former SQLDW)
+##########################################################################################################################################################
+Write-Output ""
+Write-Output  "---------------------------------------------------------------------------------------------------"
+Write-Output  "Loop through all SQL Servers (former SQLDW)"
+Write-Output  "---------------------------------------------------------------------------------------------------"
+
+for ($i = 0; $i -lt $AzureSQLServers.Count; $i++) {
+    $AzureSQLServer = $AzureSQLServers[$i]
+
+    # Log which SQL Servers are checked and in which resource group
+    Write-Output " ***************************************************************************************"    
+    Write-Output " Checking SQL Server [$($AzureSQLServer.ServerName)] in Resource Group [$($AzureSQLServer.ResourceGroupName)] for SQL Pools"
+    
+    #Check if server os part of Azure Synapse Workspace
+    $isServerSynapseWorkspace = $false
+
+    foreach ($AzureSynapseWorkspace in $AzureSynapseWorkspaces) {
+        if ($AzureSynapseWorkspace.Name -eq $AzureSQLServer.ServerName) {
+            $isServerSynapseWorkspace = $true
+            Write-Output " -> This Server is part of Synapse Workspace - Ignore here Should be done above using Az.Synapse Module"
+        }
+    }
+
+    if (!$isServerSynapseWorkspace) {
+
+        # Get all databases from a SQL Server, but filter on Edition = "DataWarehouse"
+        $allSynapseSqlPools = Get-AzSqlDatabase `
+            -ResourceGroupName $AzureSQLServer.ResourceGroupName `
+            -ServerName $AzureSQLServer.ServerName `
+        | Where-Object { $_.Edition -eq "DataWarehouse" }
+
+    
+        # Loop through each found SQL Pool
+        foreach ($SynapseSqlPool in $allSynapseSqlPools) {
+
+            ##########################################################################################################################################################
+
+            if ($SynapseSqlPool.Status -eq "Online") {
+                Write-Output  "  -> SQL Pool [$($SynapseSqlPool.DatabaseName)] found with status [Online]"
+            }
+            ##########################################################################################################################################################
+            elseif ($SynapseSqlPool.Status -eq "Paused") {
+                Write-Output  "  -> SQL Pool [$($SynapseSqlPool.DatabaseName)] found with status [Paused]"
+                # Start SQL Pool
+                $startTimePause = Get-Date
+                Write-Output  "  -> Resuming SQL Pool [$($SynapseSqlPool.DatabaseName)]"
+
+                if (!$debug) {
+                    $resultsynapseSqlPool = $SynapseSqlPool | Resume-AzSqlDatabase
+                }
+
+                # Show that the SQL Pool has been resumed and how long it took
+                $endTimeResume = Get-Date
+                $durationResume = NEW-TIMESPAN –Start $startTimePause –End $endTimeResume
+
+                if ($resultsynapseSqlPool.Status -eq "Online") {
+                    Write-Output "  -> SQL Pool [$($resultsynapseSqlPool.DatabaseName)] paused in $($durationResume.Hours) hours, $($durationResume.Minutes) minutes and $($durationResume.Seconds) seconds. Current status [$($resultsynapseSqlPool.Status)]"
+                }
+                else {
+                    if (!$debug) {
+                        $iErrorCount += 1;
+                        Write-Error "  -> (resultsynapseSqlPool.Status -eq ""Online"") SQL Pool [$($resultsynapseSqlPool.DatabaseName)] paused in $($durationResume.Hours) hours, $($durationResume.Minutes) minutes and $($durationResume.Seconds) seconds. Current status [$($resultsynapseSqlPool.Status)]"
+                    }
+                    else {
+                        Write-Host "This is a debug session - Nothing was done" -ForegroundColor Yellow
+                    }
+                }           
+            }
+            ##########################################################################################################################################################
+            else {
+                $iErrorCount += 1;
+                Write-Error "  -> ((SynapseSqlPool.Status -eq ""Online"")) Checking SQL Pool [$($SynapseSqlPool.DatabaseName)] found with status [$($SynapseSqlPool.Status)]"
+            }
+            ##########################################################################################################################################################
+           
+        }
+    }
+}
+
+##########################################################################################################################################################
+if ($iErrorCount > 0) {
+    Write-Error -Message "Resume DB script error count ($($iErrorCount)) check logs" `
+        -Exception ([System.Exception]::new()) -ErrorAction Stop 
+}
